@@ -1,0 +1,100 @@
+name: Windows SSH short-path e2e
+
+on:
+  push:
+    branches:
+      - ci/windows-ssh-shortpath-e2e
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      SSH: C:\Windows\System32\OpenSSH\ssh.exe
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Environment
+        run: |
+          [System.Environment]::OSVersion.VersionString
+          & $env:SSH -V
+          fsutil 8dot3name query C:
+          cmd /c 'dir /x "C:\" | findstr /i PROGRA'
+
+      - name: Unit tests
+        env:
+          CGO_ENABLED: "0"
+        run: go test -count=1 -v ./client/ssh/config/...
+
+      - name: Build stub
+        env:
+          CGO_ENABLED: "0"
+        run: go build -o "$env:RUNNER_TEMP\stub.exe" ./tools/sshshortpath-e2e
+
+      - name: "Case A: default install path, 8.3 enabled"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dir = 'C:\Program Files\NetBird'
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Copy-Item "$env:RUNNER_TEMP\stub.exe" "$dir\netbird.exe"
+          $pd = "$env:RUNNER_TEMP\pdA"; $mk = "$env:RUNNER_TEMP\mkA"
+          New-Item -ItemType Directory -Force $pd, $mk | Out-Null
+          $env:PROGRAMDATA = $pd; $env:NB_E2E_MARKERS = $mk
+          & "$dir\netbird.exe" 2>&1
+          $conf = "$pd\ssh\ssh_config.d\99-netbird.conf"
+          Get-Content $conf
+          $text = Get-Content -Raw $conf
+          if ($text -match 'Program Files') { throw 'config still contains the long path' }
+          if ($text -notmatch 'exec "C:\\PROGRA~1\\NetBird\\netbird.exe ssh detect') { throw 'Match exec line not shortened' }
+          if ($text -notmatch 'ProxyCommand C:\\PROGRA~1\\NetBird\\netbird.exe ssh proxy') { throw 'ProxyCommand not shortened' }
+          $ErrorActionPreference = 'Continue'
+          "--- ssh -G"
+          $g = & $env:SSH -F $conf -G peer1 2>&1 | Select-String -Pattern '^proxycommand'
+          "$g"
+          "--- connect"
+          & $env:SSH -F $conf -o ConnectTimeout=5 peer1 exit 2>&1
+          Get-ChildItem $mk | ForEach-Object { "marker $($_.Name): $(Get-Content $_.FullName)" }
+          if (-not (Test-Path "$mk\detect")) { throw 'Match exec (ssh detect) was not run' }
+          if (-not (Test-Path "$mk\proxy")) { throw 'ProxyCommand (ssh proxy) was not run' }
+          if ("$g" -notmatch 'PROGRA~1') { throw 'ssh -G shows no NetBird proxycommand' }
+          "CASE A PASS"
+          $global:LASTEXITCODE = 0
+
+      - name: "Case B: path with space, 8.3 disabled (informational)"
+        continue-on-error: true
+        run: |
+          fsutil 8dot3name set C: 1
+          $dir = 'C:\NB NoShort\Net Bird'
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Copy-Item "$env:RUNNER_TEMP\stub.exe" "$dir\netbird.exe"
+          cmd /c 'dir /x "C:\NB NoShort"'
+          $pd = "$env:RUNNER_TEMP\pdB"; $mk = "$env:RUNNER_TEMP\mkB"
+          New-Item -ItemType Directory -Force $pd, $mk | Out-Null
+          $env:PROGRAMDATA = $pd; $env:NB_E2E_MARKERS = $mk
+          & "$dir\netbird.exe" 2>&1
+          $conf = "$pd\ssh\ssh_config.d\99-netbird.conf"
+          Get-Content $conf
+          "--- ssh -G"
+          & $env:SSH -F $conf -G peer1 2>&1 | Select-String -Pattern '^proxycommand'
+          "--- connect"
+          & $env:SSH -F $conf -o ConnectTimeout=5 peer1 exit 2>&1
+          "detect ran: $(Test-Path "$mk\detect")"
+          "proxy ran:  $(Test-Path "$mk\proxy")"
+          $global:LASTEXITCODE = 0
